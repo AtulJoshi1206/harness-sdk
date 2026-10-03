@@ -10,6 +10,7 @@ from collections.abc import AsyncGenerator, Iterable
 from typing import Any, TypeVar
 
 from mistralai.client import Mistral
+from mistralai.client.models import TextChunk, ThinkChunk
 from pydantic import BaseModel
 from typing_extensions import Unpack, override
 
@@ -56,6 +57,37 @@ def _apply_cache_config(
     if cache_key and "prompt_cache_key" not in request:
         request["prompt_cache_key"] = cache_key
     warn_on_cache_config_not_supported(cache_config, "Mistral", supported={"cache_key"})
+
+
+def _split_content(content: Any) -> list[tuple[str, str]]:
+    """Split Mistral message content into ordered ``(data_type, text)`` pairs.
+
+    Reasoning models return a list of chunks instead of a string: ``ThinkChunk`` carries the reasoning trace and
+    ``TextChunk`` carries the answer.
+
+    Args:
+        content: The ``content`` of a Mistral message or streamed delta.
+
+    Returns:
+        The non-empty text parts, typed ``"reasoning_content"`` or ``"text"``.
+    """
+    if isinstance(content, str):
+        return [("text", content)] if content else []
+
+    if not isinstance(content, list):
+        return []
+
+    parts: list[tuple[str, str]] = []
+    for chunk in content:
+        if isinstance(chunk, ThinkChunk):
+            text = "".join(part.text for part in chunk.thinking if isinstance(part, TextChunk))
+            parts.append(("reasoning_content", text))
+        elif isinstance(chunk, TextChunk):
+            parts.append(("text", chunk.text))
+        else:
+            logger.debug("chunk_type=<%s> | skipping unsupported content chunk", chunk.type)
+
+    return [(data_type, text) for data_type, text in parts if text]
 
 
 class MistralModel(Model):
@@ -365,7 +397,7 @@ class MistralModel(Model):
                 return {"messageStart": {"role": "assistant"}}
 
             case "content_start":
-                if event["data_type"] == "text":
+                if event["data_type"] != "tool":
                     return {"contentBlockStart": {"start": {}}}
 
                 tool_call = event["data"]
@@ -383,6 +415,9 @@ class MistralModel(Model):
             case "content_delta":
                 if event["data_type"] == "text":
                     return {"contentBlockDelta": {"delta": {"text": event["data"]}}}
+
+                if event["data_type"] == "reasoning_content":
+                    return {"contentBlockDelta": {"delta": {"reasoningContent": {"text": event["data"]}}}}
 
                 return {"contentBlockDelta": {"delta": {"toolUse": {"input": event["data"]}}}}
 
@@ -429,18 +464,12 @@ class MistralModel(Model):
         """
         yield {"chunk_type": "message_start"}
 
-        content_started = False
-
         if response.choices and response.choices[0].message:
             message = response.choices[0].message
 
-            if hasattr(message, "content") and message.content:
-                if not content_started:
-                    yield {"chunk_type": "content_start", "data_type": "text"}
-                    content_started = True
-
-                yield {"chunk_type": "content_delta", "data_type": "text", "data": message.content}
-
+            for data_type, text in _split_content(getattr(message, "content", None)):
+                yield {"chunk_type": "content_start", "data_type": data_type}
+                yield {"chunk_type": "content_delta", "data_type": data_type, "data": text}
                 yield {"chunk_type": "content_stop"}
 
             if hasattr(message, "tool_calls") and message.tool_calls:
@@ -512,9 +541,8 @@ class MistralModel(Model):
 
                 yield self.format_chunk({"chunk_type": "message_start"})
 
-                content_started = False
+                data_type: str | None = None
                 tool_calls: dict[str, list[Any]] = {}
-                accumulated_text = ""
 
                 async for chunk in stream_response:
                     if hasattr(chunk, "data") and hasattr(chunk.data, "choices") and chunk.data.choices:
@@ -523,15 +551,13 @@ class MistralModel(Model):
                         if hasattr(choice, "delta"):
                             delta = choice.delta
 
-                            if hasattr(delta, "content") and delta.content:
-                                if not content_started:
-                                    yield self.format_chunk({"chunk_type": "content_start", "data_type": "text"})
-                                    content_started = True
-
+                            for part_type, text in _split_content(getattr(delta, "content", None)):
+                                chunks, data_type = self._stream_switch_content(part_type, data_type)
+                                for switch_chunk in chunks:
+                                    yield switch_chunk
                                 yield self.format_chunk(
-                                    {"chunk_type": "content_delta", "data_type": "text", "data": delta.content}
+                                    {"chunk_type": "content_delta", "data_type": data_type, "data": text}
                                 )
-                                accumulated_text += delta.content
 
                             if hasattr(delta, "tool_calls") and delta.tool_calls:
                                 for tool_call in delta.tool_calls:
@@ -539,8 +565,8 @@ class MistralModel(Model):
                                     tool_calls.setdefault(tool_id, []).append(tool_call)
 
                         if hasattr(choice, "finish_reason") and choice.finish_reason:
-                            if content_started:
-                                yield self.format_chunk({"chunk_type": "content_stop", "data_type": "text"})
+                            if data_type:
+                                yield self.format_chunk({"chunk_type": "content_stop", "data_type": data_type})
 
                             for tool_deltas in tool_calls.values():
                                 yield self.format_chunk(
@@ -572,6 +598,26 @@ class MistralModel(Model):
             raise
 
         logger.debug("finished streaming response from model")
+
+    def _stream_switch_content(self, data_type: str, prev_data_type: str | None) -> tuple[list[StreamEvent], str]:
+        """Handle switching to a new content stream.
+
+        Args:
+            data_type: The next content data type.
+            prev_data_type: The previous content data type.
+
+        Returns:
+            Tuple containing:
+            - Stop block for previous content and the start block for the next content.
+            - Next content data type.
+        """
+        chunks = []
+        if data_type != prev_data_type:
+            if prev_data_type is not None:
+                chunks.append(self.format_chunk({"chunk_type": "content_stop", "data_type": prev_data_type}))
+            chunks.append(self.format_chunk({"chunk_type": "content_start", "data_type": data_type}))
+
+        return chunks, data_type
 
     @override
     async def structured_output(

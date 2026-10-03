@@ -5,7 +5,7 @@ import unittest.mock
 
 import pydantic
 import pytest
-from mistralai.client.models import UserMessage
+from mistralai.client.models import TextChunk, ThinkChunk, UserMessage
 
 import strands
 from strands.agent import AgentMetadata
@@ -556,6 +556,15 @@ def test_format_chunk_content_delta_text(model):
     assert actual_chunk == exp_chunk
 
 
+def test_format_chunk_content_delta_reasoning(model):
+    event = {"chunk_type": "content_delta", "data_type": "reasoning_content", "data": "Thinking"}
+
+    actual_chunk = model.format_chunk(event)
+    exp_chunk = {"contentBlockDelta": {"delta": {"reasoningContent": {"text": "Thinking"}}}}
+
+    assert actual_chunk == exp_chunk
+
+
 def test_format_chunk_content_delta_tool(model):
     event = {
         "chunk_type": "content_delta",
@@ -786,6 +795,89 @@ async def test_tool_choice_not_supported_warns(mistral_client, model, agenerator
 
     assert len(captured_warnings) == 1
     assert "ToolChoice was provided to this provider but is not supported" in str(captured_warnings[0].message)
+
+
+@pytest.mark.asyncio
+async def test_stream_reasoning_content(mistral_client, model, agenerator, alist):
+    def mock_event(content, finish_reason=None):
+        return unittest.mock.Mock(
+            data=unittest.mock.Mock(
+                choices=[
+                    unittest.mock.Mock(
+                        delta=unittest.mock.Mock(content=content, tool_calls=None),
+                        finish_reason=finish_reason,
+                    )
+                ],
+                usage=unittest.mock.Mock(prompt_tokens=5, completion_tokens=9, total_tokens=14),
+            ),
+        )
+
+    mistral_client.chat.stream_async = unittest.mock.AsyncMock(
+        return_value=agenerator(
+            [
+                mock_event([ThinkChunk(thinking=[TextChunk(text="2+2 is 4.")])]),
+                mock_event([ThinkChunk(thinking=[], closed=True), TextChunk(text="The answer")]),
+                mock_event(" is 4.", finish_reason="stop"),
+            ]
+        )
+    )
+
+    tru_chunks = await alist(model.stream([{"role": "user", "content": [{"text": "2+2?"}]}]))
+    exp_chunks = [
+        {"messageStart": {"role": "assistant"}},
+        {"contentBlockStart": {"start": {}}},
+        {"contentBlockDelta": {"delta": {"reasoningContent": {"text": "2+2 is 4."}}}},
+        {"contentBlockStop": {}},
+        {"contentBlockStart": {"start": {}}},
+        {"contentBlockDelta": {"delta": {"text": "The answer"}}},
+        {"contentBlockDelta": {"delta": {"text": " is 4."}}},
+        {"contentBlockStop": {}},
+        {"messageStop": {"stopReason": "end_turn"}},
+        {
+            "metadata": {
+                "usage": {"inputTokens": 5, "outputTokens": 9, "totalTokens": 14},
+                "metrics": {"latencyMs": 0},
+            },
+        },
+    ]
+
+    assert tru_chunks == exp_chunks
+
+
+@pytest.mark.asyncio
+async def test_stream_non_streaming_reasoning_content(mistral_client, model_id, alist):
+    model = MistralModel(model_id=model_id, stream=False)
+    mistral_client.chat.complete_async = unittest.mock.AsyncMock(
+        return_value=unittest.mock.Mock(
+            choices=[
+                unittest.mock.Mock(
+                    message=unittest.mock.Mock(
+                        content=[
+                            ThinkChunk(thinking=[TextChunk(text="2+2 is 4.")]),
+                            TextChunk(text="The answer is 4."),
+                        ],
+                        tool_calls=None,
+                    ),
+                    finish_reason="stop",
+                )
+            ],
+            usage=None,
+        )
+    )
+
+    tru_chunks = await alist(model.stream([{"role": "user", "content": [{"text": "2+2?"}]}]))
+    exp_chunks = [
+        {"messageStart": {"role": "assistant"}},
+        {"contentBlockStart": {"start": {}}},
+        {"contentBlockDelta": {"delta": {"reasoningContent": {"text": "2+2 is 4."}}}},
+        {"contentBlockStop": {}},
+        {"contentBlockStart": {"start": {}}},
+        {"contentBlockDelta": {"delta": {"text": "The answer is 4."}}},
+        {"contentBlockStop": {}},
+        {"messageStop": {"stopReason": "end_turn"}},
+    ]
+
+    assert tru_chunks == exp_chunks
 
 
 @pytest.mark.asyncio
